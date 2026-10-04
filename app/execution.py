@@ -396,6 +396,100 @@ def get_execution(execution_id: str) -> ExecutionStatus:
         conn.close()
 
 
+def export_execution(execution_id: str) -> "ExecutionExport":
+    """Return one self-contained, single-version export of an execution.
+
+    The scenario row and every committed version row (0..current_version) are
+    read inside **one read transaction**, so a stage that lands while the
+    package is being served cannot split it across versions: the package always
+    reflects exactly one consistent ``current_version``. The package carries
+    everything a second instance needs to replay the committed prefix without
+    access to this SQLite file.
+    """
+
+    from .models import (
+        ExecutionExport,
+        ExportedStageCommit,
+        PlannedStage,
+        PlanRequest,
+        StageSnapshot,
+    )
+
+    conn = _connect()
+    try:
+        # A deferred transaction is a read transaction here: in WAL mode its
+        # snapshot is fixed at the first read and stays stable for both SELECTs.
+        conn.execute("BEGIN")
+        row = conn.execute(
+            "SELECT * FROM plan_executions WHERE execution_id = ?",
+            (execution_id,),
+        ).fetchone()
+        if row is None:
+            conn.execute("ROLLBACK")
+            raise UnknownExecution(execution_id)
+        commit_rows = conn.execute(
+            "SELECT version, stage, snapshot_json, committed_at "
+            "FROM stage_commits WHERE execution_id = ? ORDER BY version ASC",
+            (execution_id,),
+        ).fetchall()
+        conn.execute("COMMIT")
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
+    finally:
+        conn.close()
+
+    version = row["current_version"]
+    stage_count = row["stage_count"]
+
+    # Internal integrity: the write path guarantees this, but an export must
+    # never hand out a torn package, so fail loudly rather than fabricate one.
+    expected_versions = list(range(version + 1))
+    found_versions = [r["version"] for r in commit_rows]
+    if found_versions != expected_versions or any(
+        r["stage"] != r["version"] for r in commit_rows
+    ):
+        raise RuntimeError(
+            f"execution '{execution_id}' store is inconsistent: versions "
+            f"{found_versions} do not form the required prefix 0..{version}"
+        )
+
+    scenario = PlanRequest.model_validate(json.loads(row["scenario_json"]))
+    plan = [PlannedStage.model_validate(d) for d in json.loads(row["plan_json"])]
+
+    commits = []
+    for r in commit_rows:
+        snap = StageSnapshot.model_validate_json(r["snapshot_json"])
+        commits.append(
+            ExportedStageCommit(
+                version=r["version"],
+                stage=r["stage"],
+                action_ids=list(snap.action_ids),
+                anchor_observations=list(snap.anchor_observations),
+                chain_observations=list(snap.chain_observations),
+                committed_at=datetime.fromisoformat(r["committed_at"]),
+                snapshot=snap,
+            )
+        )
+
+    finished = version >= stage_count
+    return ExecutionExport(
+        execution_id=row["execution_id"],
+        version=version,
+        stage_count=stage_count,
+        completed_stages=list(range(1, version + 1)),
+        next_stage=None if finished else version + 1,
+        finished=finished,
+        created_at=datetime.fromisoformat(row["created_at"]),
+        scenario=scenario,
+        plan=plan,
+        commits=commits,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------

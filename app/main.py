@@ -19,8 +19,10 @@ from .engine import (
 from .models import (
     ChainCert,
     CommitConflict,
+    ExecutionExport,
     ExecutionRegisterRequest,
     ExecutionStatus,
+    ExecutionVerificationResult,
     Failure,
     NormalizeErrorDetail,
     NormalizeRequest,
@@ -65,9 +67,11 @@ from .execution import (
     ExecutionReplayError,
     UnknownExecution,
     commit_stage as commit_stage_service,
+    export_execution,
     get_execution,
     register_execution,
 )
+from .verification import verify_export
 
 
 class _NormalizeErrorResponse(BaseModel):
@@ -704,3 +708,56 @@ def read_plan_execution(execution_id: str) -> Any:
     """Return the execution's current version, completed stages, next stage
     and the complete immutable snapshot list (version 0 first)."""
     return get_execution(execution_id)
+
+
+@app.get(
+    "/plan-executions/{execution_id}/export",
+    response_model=ExecutionExport,
+    responses={404: {"description": "Unknown execution_id"}},
+    summary="Export one complete, single-version package for off-site replay",
+)
+def export_plan_execution(execution_id: str) -> Any:
+    """Export the registered scenario, the immutable plan and every committed
+    version (version 0 first, each with its commit content and stored
+    snapshot) as one self-contained package.
+
+    The package is read under one read transaction: even if further stages
+    land while it is being served, it corresponds to exactly one complete
+    version (``version``). Another instance can POST it unchanged to
+    ``/execution-verifications`` and replay it without any access to this
+    instance's SQLite file.
+    """
+    return export_execution(execution_id)
+
+
+@app.post(
+    "/execution-verifications",
+    response_model=ExecutionVerificationResult,
+    summary="Independently replay an exported execution package off-site",
+)
+def verify_plan_execution_export(req: ExecutionExport) -> Any:
+    """Independently verify an export package obtained from
+    ``GET /plan-executions/{id}/export``.
+
+    The verifier needs no access to the originating SQLite file: it parses the
+    package's own scenario/plan and replays the committed prefix from scratch
+    version by version. For each version it checks the commit sequence
+    (missing/duplicate/out-of-order/extra entries), the stage header, the exact
+    planned action set (empty no-op stages included), a safe deterministic
+    replay (allowed_stages, add/remove contradictions and every required
+    client→endpoint trust path), every submitted trust-anchor/endpoint-chain
+    observation, and the full stored snapshot (trust anchors, endpoint chains
+    and all communication relationships).
+
+    The first inconsistent version ends verification with
+    ``status: "conflict"`` naming that version's stage and a machine-readable
+    ``reason``; replay never continues from a faulty snapshot. When the plan is
+    not fully executed yet the response states the verified version and the
+    next stage. A verdict attests package-internal consistency only — it does
+    not authenticate the exporter or prove origin.
+
+    A body that is not even a well-formed export package is rejected with 422;
+    every content disagreement found during replay is returned as 200 with
+    ``status: "conflict"``.
+    """
+    return verify_export(req)

@@ -37,6 +37,12 @@ OCSP 响应是否由签发者（或其授权响应证书）签名、状态为 go
 值与全部通信关系，全部通过才推进版本并保存阶段快照。提交带
 `expected_version` 乐观锁，并发/过期提交返回 409 且不留部分进度，已完成阶段
 的相同重复提交幂等返回同一份快照。
+还可把某执行记录**导出为单一完整版本的自包含复核包**
+（`GET /plan-executions/{id}/export`），由**另一实例**在不访问原 SQLite 的
+情况下独立回放已提交前缀（`POST /execution-verifications`）：逐阶段核对动作、
+现场观测、信任锚、端点链快照与全部通信关系，空阶段也核对；发现缺失、重复、
+乱序或内容不符时报告首个出错阶段与机器可读原因且不再继续回放；未执行完时
+明确返回已核对版本与下一阶段；核验结论只说明包内一致性，不证明来源真实性。
 
 ## 一键启动
 
@@ -1050,6 +1056,98 @@ curl -s -X POST "http://localhost:8080/plan-executions/$EID/stages" \
 ```bash
 curl -s "http://localhost:8080/plan-executions/$EID"
 ```
+
+#### 4. 异地复核：导出与独立回放
+
+轮换执行记录可以导出为**自包含、单一完整版本**的复核包，交给**另一个实例**在
+**完全不访问原 SQLite 文件**的情况下独立回放核对。导出对应一个确定的版本：即使
+读取期间又有新阶段落账，导出包也始终对应同一个完整版本（场景行与
+`0..version` 全部提交在同一读事务内取出），不会把不同版本拼成半包。
+
+**导出（实例 A）**：
+
+```bash
+# 含登记场景、不可变原计划，以及版本 0..current 的逐阶段提交内容与快照
+curl -s "http://localhost:8080/plan-executions/$EID/export" -o execution-export.json
+```
+
+导出包顶层给出 `execution_id`、`version`（本包对应的唯一版本）、`stage_count`、
+`completed_stages`、`next_stage`、`finished`，以及 `scenario`（登记时原样存储的
+场景）、`plan`（不可变原计划）和 `commits`（版本 0 的登记项在前，其后每个版本
+一项，含该阶段的 `action_ids`、现场 `anchor_observations` /
+`chain_observations` 与该版本不可变 `snapshot`）。
+
+**核验（实例 B，无需原数据库）**：把导出包原样 POST 到另一个实例：
+
+```bash
+curl -s -X POST http://another-instance:8080/execution-verifications \
+  -H 'Content-Type: application/json' \
+  --data @execution-export.json
+```
+
+核验方只用包内的场景与计划，从版本 0 起自行重建状态并**逐阶段**独立回放，依次
+核对：提交序列完整唯一连续（无缺失/重复/乱序/越界版本）、版本与阶段头一致、
+动作集合与原计划该阶段**完全一致**（**空阶段同样核对**）、阶段可安全回放
+（`allowed_stages`、同阶段增撤矛盾、阶段后每条通信关系仍有有效信任路径）、每条
+现场信任锚/端点链观测都与确定性推出的阶段后状态一致，以及包内快照与核验方独立
+重建的快照逐项一致（动作、观测、完整信任锚集合、完整端点链集合与**全部**通信
+关系）。发现缺失、重复、乱序或任何内容不符时，返回
+`"status": "conflict"` 并给出**首个**出错阶段（`mismatch.stage` /
+`mismatch.version`）与机器可读 `reason`（如 `commit_gap`、
+`commit_duplicate_version`、`stage_out_of_order`、`commit_extra`、
+`header_mismatch`、`version_stage_mismatch`、`initial_entry_not_empty`、
+`unknown_reference`、`duplicate_observation`、`action_set_mismatch`、
+`observation_mismatch`、`snapshot_mismatch`、`invalid_scenario` /
+`invalid_plan`，或信任回放码 `untrusted_root` / `issuer_mismatch` /
+`action_not_allowed_at_stage` / `contradictory_actions_same_stage`），
+**不依据错误快照继续回放**（`verified_version` 为已确认版本数，之后的版本不再
+核验）。
+
+计划**尚未执行完**时，核验通过也会明确返回「已核对到哪个版本、下一阶段是
+几」。以上面只提交了阶段 1 的包为例：
+
+```json
+{
+  "status": "ok",
+  "execution_id": "48d2f248fc36494abf29241da7df0c23",
+  "verified_version": 1,
+  "version": 1,
+  "stage_count": 2,
+  "next_stage": 2,
+  "finished": false,
+  "mismatch": null,
+  "scope": "package-internal consistency only: ... this neither authenticates the exporter nor proves the package originated from the claimed store"
+}
+```
+
+计划全部提交后再导出核验，则 `"verified_version"` 为 2、`"next_stage"` 为
+`null`、`"finished"` 为 `true`。出错示例（把版本 1 提交的动作由
+`a1-add-new-root` 改成 `a3-remove-old-root`，阶段后即断链）：
+
+```json
+{
+  "status": "conflict",
+  "verified_version": 1,
+  "version": 1,
+  "next_stage": 2,
+  "finished": false,
+  "mismatch": {
+    "version": 1,
+    "stage": 1,
+    "reason": "untrusted_root",
+    "message": "stage 1: relationship billing-service -> api.example.com loses its trust path; ...",
+    "relationship": {"client_id": "billing-service", "endpoint_id": "api.example.com"},
+    "blocking_action": "a3-remove-old-root",
+    "chain": [{"cert_id": "leaf-old", "...": "..."}, {"cert_id": "root-old", "...": "..."}],
+    "trusted_anchors": []
+  },
+  "scope": "package-internal consistency only: ..."
+}
+```
+
+> 核验结论**只说明包内一致性**（提交前缀在登记场景与原计划下确实确定性地回放为
+> 包内的观测与快照），**不冒充来源真实性或对端身份证明**——导出方身份与传输
+> 可信应由调用方在传输/签名层另行保证（响应的 `scope` 字段始终明示这一界限）。
 
 ## 请求模型
 

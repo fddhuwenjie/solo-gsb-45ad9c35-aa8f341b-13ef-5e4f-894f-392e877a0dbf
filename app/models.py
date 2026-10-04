@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Annotated, Literal, Optional, Union
+from typing import Annotated, Any, Literal, Optional, Union
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -2011,4 +2011,194 @@ class CommitConflict(BaseModel):
         default=None,
         description="For observation_mismatch: the offending observation "
                     "plus the expected value.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Off-site cross-check: version-consistent export + independent replay verify
+# GET  /plan-executions/{id}/export
+# POST /execution-verifications
+# ---------------------------------------------------------------------------
+
+
+class ExportedStageCommit(BaseModel):
+    """One committed version of an execution as it appears in an export.
+
+    The entry at ``version == 0`` is the registration entry: its ``stage`` is
+    0 and its actions/observations are empty. Every later entry carries that
+    stage's executed actions and the field observations submitted with the
+    commit, alongside the immutable snapshot stored for the version.
+    """
+
+    version: int = Field(..., ge=0)
+    stage: int = Field(
+        ...,
+        ge=0,
+        description="0 for the registration/initial entry; equals version "
+                    "for every stage commit.",
+    )
+    action_ids: list[str] = Field(
+        ...,
+        description="Actions applied at this version (empty for version 0 "
+                    "and for explicit no-op stages).",
+    )
+    anchor_observations: list[CommitAnchorObservation] = Field(
+        ..., description="Trust-edge observations supplied with the commit."
+    )
+    chain_observations: list[CommitChainObservation] = Field(
+        ..., description="Endpoint-chain observations supplied with the commit."
+    )
+    committed_at: datetime
+    snapshot: StageSnapshot = Field(
+        ...,
+        description="The immutable snapshot stored for exactly this version.",
+    )
+
+
+class ExecutionExport(BaseModel):
+    """A self-contained, single-version export of one plan execution.
+
+    Everything a second instance needs to replay the committed prefix without
+    any access to the originating SQLite file: the verbatim registered
+    scenario, the immutable plan, the version bookkeeping and one entry per
+    committed version (0..version). The exporter reads it under one read
+    transaction, so the package always corresponds to one consistent version
+    even if more stages land while it is being served.
+    """
+
+    package_kind: Literal["rotation-plan-execution-export"] = (
+        "rotation-plan-execution-export"
+    )
+    format_version: Literal[1] = 1
+    execution_id: str
+    version: int = Field(..., ge=0, description="The one version this package captures.")
+    stage_count: int = Field(..., ge=0)
+    completed_stages: list[int] = Field(
+        ..., description="Stages committed as of the captured version."
+    )
+    next_stage: Optional[int] = Field(
+        ...,
+        description="Next stage to commit at the captured version; null when "
+                    "the whole plan was finished.",
+    )
+    finished: bool
+    created_at: datetime
+    scenario: PlanRequest = Field(
+        ..., description="The scenario stored verbatim at registration."
+    )
+    plan: list[PlannedStage] = Field(
+        ..., description="The immutable registered plan, stages 1..stage_count."
+    )
+    commits: list[ExportedStageCommit] = Field(
+        ...,
+        description="One entry per committed version, version 0 first, "
+                    "consecutive and without gaps.",
+    )
+
+
+class VerificationMismatch(BaseModel):
+    """Machine-readable location of the first failing version during replay.
+
+    A verify failure never resumes replay from the faulty snapshot: the
+    reported version is the boundary up to which the package was confirmed.
+    """
+
+    version: int = Field(
+        ...,
+        description="Version of the first entry that failed (0 = the initial "
+                    "registration entry).",
+    )
+    stage: int = Field(..., description="Stage carried by the failing entry (0 for the initial entry).")
+    reason: str = Field(
+        ...,
+        description="Machine-readable code: missing_initial_entry, "
+                    "commit_duplicate_version, commit_gap, commit_extra, "
+                    "header_mismatch, stage_out_of_order, "
+                    "version_stage_mismatch, version_ahead_of_plan, "
+                    "initial_entry_not_empty, unknown_reference, "
+                    "duplicate_observation, action_set_mismatch, "
+                    "observation_mismatch, snapshot_mismatch, "
+                    "invalid_scenario, invalid_plan, or a trust replay code "
+                    "(untrusted_root / issuer_mismatch / "
+                    "action_not_allowed_at_stage / "
+                    "contradictory_actions_same_stage).",
+    )
+    message: str
+    expected: Optional[Any] = Field(
+        default=None,
+        description="The value the independent replay expected for the "
+                    "failing item, when applicable (e.g. expected stage, "
+                    "expected action set or expected observation state).",
+    )
+    found: Optional[Any] = Field(
+        default=None,
+        description="The value actually present in the package.",
+    )
+    component: Optional[str] = Field(
+        default=None,
+        description="For snapshot_mismatch: which snapshot part disagreed "
+                    "(actions / anchor_observations / chain_observations / "
+                    "trust_anchors / endpoint_chains / relationships).",
+    )
+    relationship: Optional[RelationshipRef] = Field(
+        default=None,
+        description="For replay_failure: the relationship whose trust path broke.",
+    )
+    blocking_action: Optional[str] = None
+    chain: list[ChainCert] = Field(default_factory=list)
+    trusted_anchors: list[str] = Field(default_factory=list)
+    detail: Optional[Any] = Field(
+        default=None,
+        description="Free-form machine-readable detail for the reason "
+                    "(e.g. the offending observation plus expected state).",
+    )
+
+
+class ExecutionVerificationResult(BaseModel):
+    """Verdict of an independent off-site replay verification.
+
+    ``status`` is always 200: even an inconsistent package is a successfully
+    performed verification with ``status: conflict``. The result speaks ONLY
+    to the internal consistency of the exported package — that its commits,
+    observations and snapshots are exactly what the registered scenario and
+    plan deterministically produce. It is not proof of the exporter's
+    identity or of the package's authenticity; the transport/signing layer is
+    responsible for that, and ``scope`` states it explicitly.
+    """
+
+    status: Literal["ok", "conflict"]
+    execution_id: str
+    verified_version: int = Field(
+        ...,
+        description="Number of committed versions confirmed consistent "
+                    "(version 0 included): the last fully verified version is "
+                    "verified_version - 1. On a fully verified prefix this "
+                    "equals the package version.",
+    )
+    version: int = Field(..., description="Version the package itself declares.")
+    stage_count: int
+    next_stage: Optional[int] = Field(
+        ...,
+        description="The stage to commit next after the verified prefix, i.e. "
+                    "verified_version + 1 (null when the verified prefix "
+                    "finishes the whole plan). For a partial execution this is "
+                    "returned even when verification itself passes.",
+    )
+    finished: bool = Field(
+        ...,
+        description="True iff the verified prefix covers the whole plan.",
+    )
+    mismatch: Optional[VerificationMismatch] = Field(
+        default=None,
+        description="The first (and only reported) failing version; null when "
+                    "every exported version is internally consistent.",
+    )
+    scope: str = Field(
+        default=(
+            "package-internal consistency only: the committed prefix replays "
+            "exactly to the exported observations and snapshots under the "
+            "registered scenario and plan; this neither authenticates the "
+            "exporter nor proves the package originated from the claimed store"
+        ),
+        description="Explicit boundary of what the verdict establishes.",
     )
