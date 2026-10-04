@@ -1978,6 +1978,145 @@ class ExecutionStatus(BaseModel):
     )
 
 
+# ---------------------------------------------------------------------------
+# Off-site review: version-consistent export + independent replay verification
+# GET /plan-executions/{id}/export, POST /execution-reviews
+# ---------------------------------------------------------------------------
+
+EXECUTION_EXPORT_FORMAT = "rotation-execution-export/v1"
+
+
+class ExecutionExport(BaseModel):
+    """Self-contained, version-consistent audit export of one plan execution.
+
+    Produced by ``GET /plan-executions/{id}/export``: every row is read
+    inside a single SQLite transaction, so the package always corresponds to
+    exactly one complete version even when new stages commit while it is
+    being read. Posted to ``POST /execution-reviews`` (on any instance, with
+    no access to the source database) it is enough to independently replay
+    the committed prefix and verify every exported snapshot.
+    """
+
+    format: Literal["rotation-execution-export/v1"] = Field(
+        default=EXECUTION_EXPORT_FORMAT,
+        description="Wire format tag of the package; must be "
+                    "'rotation-execution-export/v1'.",
+    )
+    execution_id: str
+    version: int = Field(
+        ...,
+        ge=0,
+        description="The execution's current version at export time: the "
+                    "number of committed stages the package covers.",
+    )
+    stage_count: int = Field(
+        ..., ge=0, description="Total stages of the immutable plan."
+    )
+    scenario: PlanRequest = Field(
+        ...,
+        description="The registered scenario, verbatim (certificates, trust "
+                    "anchors, endpoints, relationships, actions, plan_time).",
+    )
+    plan: list[ExecutionStage] = Field(
+        ...,
+        description="The immutable registered plan: stages numbered "
+                    "consecutively from 1, no-op empty stages included.",
+    )
+    snapshots: list[StageSnapshot] = Field(
+        ...,
+        description="Every saved snapshot, version 0 (the initial state) "
+                    "first, then exactly one per committed stage in order. "
+                    "Each snapshot carries the committed content (action_ids "
+                    "and field observations) plus the post-stage state.",
+    )
+
+
+class ExecutionReviewSuccess(BaseModel):
+    """200 verdict: the exported package is internally consistent."""
+
+    status: Literal["consistent"] = "consistent"
+    execution_id: str
+    verified_version: int = Field(
+        ...,
+        description="Every stage snapshot up to and including this version "
+                    "was independently replayed and matched.",
+    )
+    stage_count: int = Field(..., description="Total stages of the plan.")
+    next_stage: Optional[int] = Field(
+        ...,
+        description="The stage that must commit next; null once the whole "
+                    "plan (including trailing no-op stages) is finished.",
+    )
+    finished: bool
+    scope: Literal["package_internal_consistency"] = Field(
+        default="package_internal_consistency",
+        description="The verdict attests only the internal consistency of "
+                    "the exported package; it is not a proof of the source "
+                    "execution's authenticity.",
+    )
+    message: str
+
+
+class ExecutionReviewFailure(BaseModel):
+    """409 verdict: the first stage at which the package contradicts itself."""
+
+    status: Literal["inconsistent"] = "inconsistent"
+    execution_id: str
+    stage: int = Field(
+        ...,
+        description="First failing stage; 0 is the initial snapshot (also "
+                    "used for package-level structural disagreements).",
+    )
+    reason: str = Field(
+        ...,
+        description="Machine-readable code: stage_count_mismatch, "
+                    "duplicate_stage, missing_stage, unexpected_stage, "
+                    "stage_out_of_order, action_set_mismatch, "
+                    "observation_mismatch, snapshot_mismatch, or a trust "
+                    "replay code (untrusted_root / issuer_mismatch / "
+                    "action_not_allowed_at_stage / "
+                    "contradictory_actions_same_stage).",
+    )
+    message: str
+    verified_version: Optional[int] = Field(
+        ...,
+        description="Content-verified through this version before the "
+                    "failure; null when the stage sequence itself is broken "
+                    "and no content replay was possible.",
+    )
+    scope: Literal["package_internal_consistency"] = Field(
+        default="package_internal_consistency",
+        description="The verdict attests only the internal consistency of "
+                    "the exported package; it is not a proof of the source "
+                    "execution's authenticity.",
+    )
+    relationship: Optional[RelationshipRef] = None
+    blocking_action: Optional[str] = None
+    chain: list[ChainCert] = Field(default_factory=list)
+    trusted_anchors: list[str] = Field(default_factory=list)
+    observation: Optional[dict] = Field(
+        default=None,
+        description="For observation_mismatch: the offending observation "
+                    "plus the replayed value.",
+    )
+    snapshot_field: Optional[str] = Field(
+        default=None,
+        description="For snapshot_mismatch: which snapshot field disagrees "
+                    "with the independent replay (version / action_ids / "
+                    "anchor_observations / chain_observations / "
+                    "trust_anchors / endpoint_chains / relationships).",
+    )
+    expected: Optional[list] = Field(
+        default=None,
+        description="The values the independent replay computed, where "
+                    "applicable.",
+    )
+    actual: Optional[list] = Field(
+        default=None,
+        description="The values found in the package, where applicable.",
+    )
+
+
 class CommitConflict(BaseModel):
     """409 body for a rejected (or idempotently replayed) stage commit."""
 

@@ -36,7 +36,10 @@ OCSP 响应是否由签发者（或其授权响应证书）签名、状态为 go
 现场信任锚/端点链观测；服务在单个 SQLite 事务内按计划顺序校验动作集合、观测
 值与全部通信关系，全部通过才推进版本并保存阶段快照。提交带
 `expected_version` 乐观锁，并发/过期提交返回 409 且不留部分进度，已完成阶段
-的相同重复提交幂等返回同一份快照。
+的相同重复提交幂等返回同一份快照。执行记录还支持**异地复核**：
+`GET /plan-executions/{id}/export` 在单个读事务内导出自包含审计包（读取期间
+的新落账不会撕裂版本），另一实例用 `POST /execution-reviews` 无需访问原
+SQLite 即可独立回放已提交前缀、逐阶段核对动作/观测/快照与全部通信关系。
 
 ## 一键启动
 
@@ -1049,6 +1052,102 @@ curl -s -X POST "http://localhost:8080/plan-executions/$EID/stages" \
 
 ```bash
 curl -s "http://localhost:8080/plan-executions/$EID"
+```
+
+#### 4. `GET /plan-executions/{execution_id}/export` — 导出版本一致的异地复核包
+
+把某个执行的**登记场景、不可变计划、逐阶段提交内容与全部快照**打包成一个
+自包含 JSON 包，供另一实例离线核验。执行行与全部快照行在**同一个 SQLite 读
+事务**内读取：导出期间即使有新阶段落账，导出包也始终对应**同一个完整版本**，
+绝不会把版本边界两侧的数据撕裂混装。
+
+```bash
+curl -s "http://localhost:8080/plan-executions/$EID/export" > /tmp/export.json
+```
+
+包结构：`format`（固定为 `rotation-execution-export/v1`）、`execution_id`、
+`version`（导出时的当前版本）、`stage_count`、`scenario`（登记场景原文）、
+`plan`（不可变计划）、`snapshots`（版本 0 初始快照在前，之后每个已提交阶段
+恰好一份、按阶段升序）。每份阶段快照同时携带该阶段的**提交内容**（动作与
+现场观测）和**阶段后状态**（完整信任锚集合、各端点链与每条关系的校验结果），
+即「逐阶段提交内容和快照」由同一对象承载。
+
+#### 5. `POST /execution-reviews` — 异地独立回放核验
+
+另一实例接收导出包并**独立回放已提交前缀**——本接口完全不触碰任何数据库，
+核验方无需访问原 SQLite。从包内场景与计划出发逐阶段核对（**空阶段也核对**）：
+
+1. 提交的动作集合必须等于该计划阶段排定的动作（否则 `action_set_mismatch`）；
+2. 动作的信任回放必须合法：排在 `allowed_stages` 内、同阶段无增撤矛盾、
+   阶段结束后**全部**通信关系仍有有效信任路径（否则 `untrusted_root` /
+   `issuer_mismatch` / `action_not_allowed_at_stage` /
+   `contradictory_actions_same_stage`，结构与 `/plans/verify` 的 Failure 同源）；
+3. 每条现场信任锚/端点链观测必须与回放出的阶段后状态一致
+   （否则 `observation_mismatch`，附提交值与回放值）；
+4. 导出快照必须与核验方**自行重算**的快照逐字段一致：版本号、提交内容、
+   完整信任锚集合、端点链快照与全部通信关系（否则 `snapshot_mismatch`，
+   `snapshot_field` 定位到 `version` / `action_ids` / `anchor_observations` /
+   `chain_observations` / `trust_anchors` / `endpoint_chains` /
+   `relationships`，并附 `expected` / `actual`）。
+
+回放状态永远由核验方根据已提交动作自行计算，**绝不采用包内快照作为回放
+状态**；发现缺失（`missing_stage`，含初始快照）、重复（`duplicate_stage`）、
+乱序（`stage_out_of_order`）、越界（`unexpected_stage`）或内容不符时，在
+**首个出错阶段**停止并返回 `409` 与机器可读原因（`verified_version` 给出
+此前已核对的最高版本；序列级错误尚未能回放时为 `null`），不依据错误快照
+继续回放。包无法解释（场景/计划结构非法、观测引用未知对象、`format` 不符）
+返回 `422`。
+
+无需登记任何执行，直接核验本仓库附带的示例包（由
+`examples/gen_execution_review_example.py` 生成：登记示例场景、提交阶段 1
+后导出，计划共 2 个阶段）：
+
+```bash
+curl -s -X POST http://localhost:8080/execution-reviews \
+  -H 'Content-Type: application/json' \
+  --data @examples/execution_review_request.json
+```
+
+```json
+{
+  "status": "consistent",
+  "execution_id": "8fdbc47f...",
+  "verified_version": 1,
+  "stage_count": 2,
+  "next_stage": 2,
+  "finished": false,
+  "scope": "package_internal_consistency",
+  "message": "all 1 committed stage(s) of execution '8fdbc47f...' (including
+   any no-op stages) replay exactly to their exported snapshots; ... This
+   verdict attests only the internal consistency of the exported package,
+   not the authenticity of its source."
+}
+```
+
+**计划尚未执行完时**，成功响应明确返回已核对版本 `verified_version` 与下一
+阶段 `next_stage`（全部完成时 `finished: true`、`next_stage: null`）。
+**核验结果仅说明包内一致性**：`scope` 恒为
+`package_internal_consistency`——它证明导出包内部自洽（每个已提交阶段都能
+精确回放出自己的快照），**不构成对来源执行真实性的证明**。
+
+完整的异地复核流程（实例 B 可以是同一服务的另一部署，无需共享数据库）：
+
+```bash
+# 实例 A：登记、提交阶段 1（响应中的 execution_id 记为 $EID）
+curl -s -X POST http://instance-a:8080/plan-executions \
+  -H 'Content-Type: application/json' \
+  --data @examples/execution_register_request.json
+curl -s -X POST "http://instance-a:8080/plan-executions/$EID/stages" \
+  -H 'Content-Type: application/json' \
+  --data @examples/execution_commit_stage1.json
+
+# 实例 A：导出版本一致的审计包
+curl -s "http://instance-a:8080/plan-executions/$EID/export" > /tmp/export.json
+
+# 实例 B：独立回放核验（不访问实例 A 的 SQLite）
+curl -s -X POST http://instance-b:8080/execution-reviews \
+  -H 'Content-Type: application/json' \
+  --data @/tmp/export.json
 ```
 
 ## 请求模型

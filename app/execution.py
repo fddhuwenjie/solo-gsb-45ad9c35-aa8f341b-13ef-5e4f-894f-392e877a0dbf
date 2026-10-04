@@ -52,6 +52,7 @@ from .models import (
     CommitAnchorObservation,
     CommitChainObservation,
     CommitConflict,
+    ExecutionExport,
     ExecutionRegisterRequest,
     ExecutionStage,
     ExecutionStatus,
@@ -394,6 +395,63 @@ def get_execution(execution_id: str) -> ExecutionStatus:
         return _status_from_row(conn, row)
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Version-consistent export for off-site review
+# ---------------------------------------------------------------------------
+
+
+def export_execution(execution_id: str) -> ExecutionExport:
+    """Assemble a self-contained export of one execution for off-site review.
+
+    The execution row and every stage snapshot are read inside **one** SQLite
+    transaction, so the package always corresponds to exactly one complete
+    version: stages committed while the export is being read are either all
+    visible or all invisible, never torn across a version boundary. The
+    receiving instance needs no access to this database to replay and verify
+    the package (see ``app.review``).
+    """
+
+    conn = _connect()
+    try:
+        conn.execute("BEGIN")
+        try:
+            row = conn.execute(
+                "SELECT * FROM plan_executions WHERE execution_id = ?",
+                (execution_id,),
+            ).fetchone()
+            if row is None:
+                raise UnknownExecution(execution_id)
+            cur = conn.execute(
+                "SELECT snapshot_json FROM stage_commits "
+                "WHERE execution_id = ? ORDER BY version ASC",
+                (execution_id,),
+            )
+            snapshots = [
+                StageSnapshot.model_validate_json(blob)
+                for (blob,) in cur.fetchall()
+            ]
+            scenario_blob = row["scenario_json"]
+            plan_blob = row["plan_json"]
+            version = row["current_version"]
+            stage_count = row["stage_count"]
+        finally:
+            try:
+                conn.execute("ROLLBACK")  # read-only transaction
+            except sqlite3.Error:
+                pass
+    finally:
+        conn.close()
+
+    return ExecutionExport(
+        execution_id=execution_id,
+        version=version,
+        stage_count=stage_count,
+        scenario=PlanRequest.model_validate(json.loads(scenario_blob)),
+        plan=[ExecutionStage.model_validate(d) for d in json.loads(plan_blob)],
+        snapshots=snapshots,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -19,7 +19,10 @@ from .engine import (
 from .models import (
     ChainCert,
     CommitConflict,
+    ExecutionExport,
     ExecutionRegisterRequest,
+    ExecutionReviewFailure,
+    ExecutionReviewSuccess,
     ExecutionStatus,
     Failure,
     NormalizeErrorDetail,
@@ -65,9 +68,11 @@ from .execution import (
     ExecutionReplayError,
     UnknownExecution,
     commit_stage as commit_stage_service,
+    export_execution,
     get_execution,
     register_execution,
 )
+from .review import ReviewInconsistent, review_export
 
 
 class _NormalizeErrorResponse(BaseModel):
@@ -160,6 +165,12 @@ async def _unknown_execution_handler(_request, exc: UnknownExecution):
         status_code=404,
         content={"detail": f"unknown execution_id '{exc.execution_id}'"},
     )
+
+
+@app.exception_handler(ReviewInconsistent)
+async def _review_inconsistent_handler(_request, exc: ReviewInconsistent):
+    # The exported package contradicts itself at some stage (HTTP 409).
+    return JSONResponse(status_code=409, content=exc.failure.model_dump())
 
 
 # ---------------------------------------------------------------------------
@@ -704,3 +715,55 @@ def read_plan_execution(execution_id: str) -> Any:
     """Return the execution's current version, completed stages, next stage
     and the complete immutable snapshot list (version 0 first)."""
     return get_execution(execution_id)
+
+
+# ---------------------------------------------------------------------------
+# Off-site review: version-consistent export + independent replay
+# ---------------------------------------------------------------------------
+
+
+@app.get(
+    "/plan-executions/{execution_id}/export",
+    response_model=ExecutionExport,
+    responses={404: {"description": "Unknown execution_id"}},
+    summary="Export a self-contained, version-consistent audit package",
+)
+def export_plan_execution(execution_id: str) -> Any:
+    """Export the registered scenario, the immutable plan and every committed
+    stage's content and snapshot as one self-contained package.
+
+    All rows are read inside a single SQLite transaction, so the package
+    always corresponds to exactly one complete version even when new stages
+    commit while the export is being read. The package can be handed to
+    ``POST /execution-reviews`` on any instance — the receiver needs no
+    access to this service's database.
+    """
+    return export_execution(execution_id)
+
+
+@app.post(
+    "/execution-reviews",
+    response_model=ExecutionReviewSuccess,
+    responses={409: {"model": ExecutionReviewFailure}},
+    summary="Independently replay and verify an exported execution package",
+)
+def review_execution_export(req: ExecutionExport) -> Any:
+    """Verify an exported execution package without touching any database.
+
+    The committed prefix is replayed independently from the exported
+    scenario and plan. Every committed stage — no-op stages included — is
+    checked: the committed action set against the plan stage, the trust
+    replay of those actions, the field observations against the replayed
+    post-stage state, and the exported snapshot (trust anchors, endpoint
+    chains and every communication relationship) against the reviewer's own
+    recomputation. The replay never adopts an exported snapshot as its
+    state and stops at the first stage that is missing, duplicated, out of
+    order or content-mismatched, reporting that stage and a machine-readable
+    reason (409).
+
+    A ``consistent`` verdict attests **package-internal consistency only**;
+    it is not a proof of the source execution's authenticity. When the plan
+    is not fully executed, the response names the verified version and the
+    next stage to commit.
+    """
+    return review_export(req)
